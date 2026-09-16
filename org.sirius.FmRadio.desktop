@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FM Radio
+Comment=Listen to FM radio with the phone's built-in tuner
+Exec=/usr/local/bin/sirius-fm
+Icon=org.sirius.FmRadio
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=FM;radio;tuner;RDS;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

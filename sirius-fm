@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""FM Radio for the Sony Xperia Z2 on Phosh.
+
+Tuning, scanning and RDS go through sirius-fmd, which owns the Broadcom tuner.
+Audio is captured from the card's FM port and played to the sound server, on
+the output chosen with the button at the top right: the speaker, a connected
+Bluetooth device, or headphones once the headphone codec has a driver.
+
+The station list is refreshed by a scan in the background each time the app
+opens. The previous list stays usable meanwhile, and is only replaced when the
+new scan finds stations, so opening the app without the headphone lead (the
+aerial) plugged in does not wipe it.
+"""
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import threading
+import time
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "org.sirius.FmRadio"
+SOCK_PATH = "/run/sirius-fm/sirius-fm.sock"
+STATE_DIR = os.path.join(GLib.get_user_data_dir(), "sirius-fm")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+# FM capture has its own front end, MultiMedia2: MultiMedia1 is held open for
+# speaker playback and its route cannot be shared. The tuner's I2S arrives on
+# the secondary MI2S pads, so the back end is SEC_MI2S_TX.
+MIXER = "MultiMedia2 Mixer SEC_MI2S_TX"
+CARD = os.environ.get("SIRIUS_FM_CARD", "0")
+# Audio processing modes, chosen from the header. Mono and noise reduction are
+# what a hardware radio does on a weak signal; kept optional so they can be
+# compared on air (different locations, aerial length).
+NR, MONO, STEREO = "nr", "mono", "stereo"
+AUDIO_MODES = [
+    (NR, "Noise reduction", "Mono, high frequencies rolled off"),
+    (MONO, "Mono", "Both channels summed, full range"),
+    (STEREO, "Stereo", "Raw capture, no processing"),
+]
+AUDIO_ICON = "audio-x-generic-symbolic"
+
+
+def have_filter():
+    return shutil.which("sirius-fm-downmix") is not None
+
+
+FMREPAIR_PLUGIN = "/usr/lib/alsa-lib/libasound_module_pcm_fmrepair.so"
+
+
+def capture_pcm(device):
+    """ALSA PCM to read FM audio from.
+
+    The port's fmrepair ALSA plugin (drivers/audio/fmrepair) exposes the raw
+    MultiMedia2 capture as "sirius_fm" with the tuner's periodic I2S burst
+    corruption repaired at the device layer, so every client gets clean audio.
+    Fall back to the raw device when the plugin is not installed.
+    """
+    if os.path.exists(FMREPAIR_PLUGIN):
+        return f"sirius_fm:CARD={CARD},DEV={device}"
+    return f"hw:{CARD},{device}"
+
+
+def build_pipeline(device, sink, mode):
+    dev = capture_pcm(device)
+    src = f"exec arecord -q -D {dev} -f S16_LE -r 48000 -c 2 -t raw"
+    tail = f"pacat --playback --format=s16le --rate=48000 {sink} " \
+           "--client-name='Robwatts Radio' --stream-name='Robwatts Radio'"
+    if mode == STEREO or not have_filter():
+        return f"{src} | {tail} --channels=2"
+    flags = " --no-lowpass" if mode == MONO else ""
+    return f"{src} | sirius-fm-downmix{flags} | {tail} --channels=1"
+
+SPEAKER, HEADPHONES, BLUETOOTH = "speaker", "headphones", "bluetooth"
+OUTPUT_ICONS = {
+    SPEAKER: "audio-speakers-symbolic",
+    HEADPHONES: "audio-headphones-symbolic",
+    BLUETOOTH: "bluetooth-active-symbolic",
+}
+
+
+# --------------------------------------------------------------- daemon link
+
+class DaemonError(Exception):
+    pass
+
+
+def request(cmd, stream=None, **kw):
+    """Send one request; for streaming replies call stream(obj) per line."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK_PATH)
+    except OSError as e:
+        raise DaemonError("The FM tuner service is not running") from e
+    with s, s.makefile("rw") as f:
+        f.write(json.dumps({"cmd": cmd, **kw}) + "\n")
+        f.flush()
+        for line in f:
+            obj = json.loads(line)
+            if "progress" in obj and stream:
+                stream(obj)
+                continue
+            if not obj.get("ok"):
+                raise DaemonError(obj.get("error", "tuner error"))
+            return obj
+    raise DaemonError("The FM tuner service closed the connection")
+
+
+def in_thread(work, done=None, fail=None):
+    def run():
+        try:
+            result = work()
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            if fail:
+                GLib.idle_add(fail, e)
+            return
+        if done:
+            GLib.idle_add(done, result)
+    threading.Thread(target=run, daemon=True).start()
+
+
+# --------------------------------------------------------------------- audio
+
+def fm_capture_device():
+    """Device number of the MultiMedia2 capture PCM, or None.
+
+    Found by name: the number follows the order of the sound card's links in
+    the device tree. The PCM only exists when the device tree declares the
+    MultiMedia2 front end.
+    """
+    try:
+        with open("/proc/asound/pcm") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        ids, _, rest = line.partition(":")
+        card, _, dev = ids.partition("-")
+        if (card.isdigit() and int(card) == int(CARD) and dev.isdigit()
+                and rest.strip().startswith("MultiMedia2") and "capture" in rest):
+            return int(dev)
+    return None
+
+
+def mixer_available():
+    if fm_capture_device() is None:
+        return False
+    r = subprocess.run(["amixer", "-c", CARD, "cget", f"name={MIXER}"],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def set_mixer(on):
+    subprocess.run(["amixer", "-q", "-c", CARD, "cset", f"name={MIXER}",
+                    "1" if on else "0"], capture_output=True)
+
+
+# The headphone jack and the loudspeakers are the same PCM with different
+# routing. There is no UCM device for the jack: PulseAudio turns two UCM
+# devices that share a PCM into two card profiles rather than two ports, and
+# switching profile drops the sink. So the route is set here instead.
+#
+# Everything from "SLIM RX1 MUX" onwards is inside the WCD9320 codec. The
+# codec's own muxes have to be pointing at the SLIMbus port before the
+# routing mixer is switched on, or the DSP refuses to start the port.
+HEADPHONE_ROUTE = [
+    ("QUAT_MI2S_RX Audio Mixer MultiMedia1", "0"),
+    ("SLIM RX1 MUX", "AIF1_PB"),
+    ("SLIM RX2 MUX", "AIF1_PB"),
+    ("RX1 MIX1 INP1", "RX1"),
+    ("RX2 MIX1 INP1", "RX2"),
+    ("CLASS_H_DSM MUX", "DSM_HPHL_RX1"),
+    ("HPHL DAC Switch", "1"),
+    ("HPHL Volume", "19"),
+    ("HPHR Volume", "19"),
+    ("SLIMBUS_0_RX Audio Mixer MultiMedia1", "1"),
+]
+
+SPEAKER_ROUTE = [
+    ("SLIMBUS_0_RX Audio Mixer MultiMedia1", "0"),
+    ("HPHL DAC Switch", "0"),
+    ("CLASS_H_DSM MUX", "ZERO"),
+    ("SLIM RX1 MUX", "ZERO"),
+    ("SLIM RX2 MUX", "ZERO"),
+    ("QUAT_MI2S_RX Audio Mixer MultiMedia1", "1"),
+]
+
+
+def control_exists(name):
+    r = subprocess.run(["amixer", "-c", CARD, "cget", f"name={name}"],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def have_headphone_codec():
+    """True when the WCD9320 codec is present, so the jack can be driven."""
+    return control_exists("HPHL DAC Switch")
+
+
+def apply_route(route):
+    for name, value in route:
+        subprocess.run(["amixer", "-q", "-c", CARD, "cset", f"name={name}", value],
+                       capture_output=True)
+
+
+def list_outputs():
+    """The outputs to offer, as dicts with key, kind, title, subtitle, sink, usable.
+
+    Bluetooth appears once, greyed, when no audio device is connected, and as
+    one entry per connected device otherwise. Headphones are greyed when the
+    WCD9320 codec is not loaded. Nothing detects whether anything is actually
+    plugged into the jack: the codec's jack detection is not driven yet.
+    """
+    try:
+        out = subprocess.run(["pactl", "-f", "json", "list", "sinks"],
+                             capture_output=True, text=True, timeout=5).stdout
+        sinks = json.loads(out or "[]")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        sinks = []
+
+    def api(s):
+        props = s.get("properties", {})
+        if props.get("device.api") == "bluez" or s.get("name", "").startswith("bluez_"):
+            return "bluez"
+        return props.get("device.api", "")
+
+    speaker = next((s for s in sinks if api(s) == "alsa"), None)
+    outputs = [{
+        "key": SPEAKER, "kind": SPEAKER, "title": "Speaker",
+        "subtitle": "" if speaker else "The sound server has no speaker output",
+        "sink": speaker["name"] if speaker else None,
+        "usable": speaker is not None,
+    }, {
+        "key": HEADPHONES, "kind": HEADPHONES, "title": "Headphones",
+        "subtitle": "" if have_headphone_codec()
+                    else "Not available: the headphone codec is not loaded",
+        # Same sink as the speaker; only the routing differs.
+        "sink": speaker["name"] if speaker else None,
+        "usable": speaker is not None and have_headphone_codec(),
+    }]
+    bluetooth = [s for s in sinks if api(s) == "bluez"]
+    for s in bluetooth:
+        outputs.append({
+            "key": BLUETOOTH + ":" + s["name"], "kind": BLUETOOTH,
+            "title": s.get("description") or "Bluetooth", "subtitle": "Bluetooth",
+            "sink": s["name"], "usable": True,
+        })
+    if not bluetooth:
+        outputs.append({
+            "key": BLUETOOTH, "kind": BLUETOOTH, "title": "Bluetooth",
+            "subtitle": "No device connected", "sink": None, "usable": False,
+        })
+    return outputs
+
+
+# ---------------------------------------------------------------------- state
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    state.setdefault("mhz", 98.9)
+    state.setdefault("stations", [])
+    state.setdefault("output", SPEAKER)
+    return state
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE_FILE)
+
+
+# ------------------------------------------------------------------------- UI
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="FM Radio")
+        self.set_default_size(360, 720)
+        self.state = load_state()
+        self.mhz = float(self.state["mhz"])
+        self.audio_mode = self.state.get("audio_mode", NR)
+        if self.audio_mode not in dict((m[0], m) for m in AUDIO_MODES):
+            self.audio_mode = NR
+        self.outputs = []
+        self.player = None
+        self.player_sink = None
+        self.player_kind = None
+        self.scanning = False
+        self.scan_progress = 0.0
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+
+        # Sound mode, top left: stereo / mono / noise reduction.
+        self.audio_button = Gtk.MenuButton(icon_name=AUDIO_ICON,
+                                           tooltip_text="Sound")
+        audio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                            margin_top=6, margin_bottom=6,
+                            margin_start=6, margin_end=6, width_request=260)
+        audio_box.append(Gtk.Label(label="Sound", xalign=0,
+                                   css_classes=["heading"]))
+        audio_list = Gtk.ListBox(css_classes=["boxed-list"],
+                                 selection_mode=Gtk.SelectionMode.NONE)
+        group = None
+        for key, title, subtitle in AUDIO_MODES:
+            usable = key == STEREO or have_filter()
+            check = Gtk.CheckButton(active=key == self.audio_mode,
+                                    sensitive=usable)
+            if group:
+                check.set_group(group)
+            else:
+                group = check
+            row = Adw.ActionRow(title=title, subtitle=subtitle, sensitive=usable)
+            row.add_prefix(check)
+            row.set_activatable_widget(check)
+            check.connect("toggled", self.on_audio_mode_toggled, key)
+            audio_list.append(row)
+        audio_box.append(audio_list)
+        if not have_filter():
+            audio_box.append(Gtk.Label(
+                label="Install the app to enable mono and noise reduction.",
+                xalign=0, wrap=True, css_classes=["caption", "dim-label"]))
+        self.audio_button.set_popover(Gtk.Popover(child=audio_box))
+        self.audio_button.set_tooltip_text(
+            "Sound: " + next(t for k, t, _ in AUDIO_MODES if k == self.audio_mode))
+        header.pack_start(self.audio_button)
+
+        # Output, top right: the icon shows what is selected.
+        self.output_button = Gtk.MenuButton(icon_name=OUTPUT_ICONS[SPEAKER],
+                                            tooltip_text="Output")
+        output_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                             margin_top=6, margin_bottom=6,
+                             margin_start=6, margin_end=6, width_request=280)
+        output_box.append(Gtk.Label(label="Play on", xalign=0,
+                                    css_classes=["heading"]))
+        self.output_list = Gtk.ListBox(css_classes=["boxed-list"],
+                                       selection_mode=Gtk.SelectionMode.NONE)
+        output_box.append(self.output_list)
+        self.output_popover = Gtk.Popover(child=output_box)
+        self.output_popover.connect("show", lambda *_: self.refresh_outputs())
+        self.output_button.set_popover(self.output_popover)
+        header.pack_end(self.output_button)
+
+        # Stations, next to it.
+        self.stations_button = Gtk.MenuButton(icon_name="view-list-bullet-symbolic",
+                                              tooltip_text="Stations")
+        stations_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                               margin_top=6, margin_bottom=6,
+                               margin_start=6, margin_end=6, width_request=280)
+        stations_box.append(Gtk.Label(label="Stations", xalign=0,
+                                      css_classes=["heading"]))
+        self.scan_label = Gtk.Label(xalign=0, wrap=True,
+                                    css_classes=["caption", "dim-label"])
+        stations_box.append(self.scan_label)
+        self.progress = Gtk.ProgressBar(visible=False)
+        stations_box.append(self.progress)
+        self.station_list = Gtk.ListBox(css_classes=["boxed-list"],
+                                        selection_mode=Gtk.SelectionMode.NONE)
+        self.station_list.set_placeholder(Gtk.Label(
+            label="No stations yet", margin_top=12, margin_bottom=12,
+            css_classes=["dim-label"]))
+        stations_box.append(Gtk.ScrolledWindow(
+            child=self.station_list, max_content_height=420,
+            propagate_natural_height=True,
+            hscrollbar_policy=Gtk.PolicyType.NEVER))
+        self.rescan_button = Gtk.Button(label="Scan again", css_classes=["pill"],
+                                        halign=Gtk.Align.CENTER)
+        self.rescan_button.connect("clicked", lambda *_: self.start_scan())
+        stations_box.append(self.rescan_button)
+        self.stations_popover = Gtk.Popover(child=stations_box)
+        self.stations_button.set_popover(self.stations_popover)
+        header.pack_end(self.stations_button)
+
+        toolbar.add_top_bar(header)
+        self.banner = Adw.Banner()
+        toolbar.add_top_bar(self.banner)
+
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                       margin_top=48, margin_bottom=24,
+                       margin_start=12, margin_end=12)
+
+        self.freq_label = Gtk.Label(css_classes=["title-1"])
+        self.name_label = Gtk.Label(css_classes=["title-3", "dim-label"])
+        page.append(self.freq_label)
+        page.append(self.name_label)
+
+        signal = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        self.level = Gtk.LevelBar(min_value=0, max_value=1, width_request=180,
+                                  valign=Gtk.Align.CENTER)
+        self.signal_label = Gtk.Label(css_classes=["caption", "dim-label"])
+        signal.append(self.level)
+        signal.append(self.signal_label)
+        page.append(signal)
+
+        controls = Gtk.Box(spacing=18, halign=Gtk.Align.CENTER)
+        self.down_button = Gtk.Button(icon_name="go-previous-symbolic",
+                                      css_classes=["circular", "flat"],
+                                      tooltip_text="Previous station")
+        self.down_button.connect("clicked", lambda *_: self.step_station(-1))
+        self.play_button = Gtk.Button(icon_name="media-playback-start-symbolic",
+                                      css_classes=["circular", "suggested-action"],
+                                      width_request=64, height_request=64,
+                                      tooltip_text="Play")
+        self.play_button.connect("clicked", self.on_play)
+        self.up_button = Gtk.Button(icon_name="go-next-symbolic",
+                                    css_classes=["circular", "flat"],
+                                    tooltip_text="Next station")
+        self.up_button.connect("clicked", lambda *_: self.step_station(1))
+        for b in (self.down_button, self.play_button, self.up_button):
+            controls.append(b)
+        page.append(controls)
+
+        fine = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        for label, delta in (("−0.1", -0.1), ("+0.1", 0.1)):
+            b = Gtk.Button(label=label, css_classes=["pill"])
+            b.connect("clicked", lambda _b, d=delta: self.tune(self.mhz + d))
+            fine.append(b)
+        page.append(fine)
+
+        clamp = Adw.Clamp(maximum_size=480, child=page)
+        toolbar.set_content(Gtk.ScrolledWindow(child=clamp, vexpand=True))
+        self.set_content(toolbar)
+
+        self.refresh_stations()
+        self.update_scan_label()
+        self.update_freq_label()
+        self.connect("close-request", self.on_close)
+        GLib.timeout_add_seconds(1, self.poll)
+        GLib.timeout_add_seconds(5, self.poll_outputs)
+        self.refresh_outputs()
+        self.start_scan()
+
+    # ----------------------------------------------------------------- helpers
+
+    def show_error(self, message):
+        self.banner.set_title(str(message))
+        self.banner.set_revealed(True)
+        return False
+
+    def clear_error(self):
+        self.banner.set_revealed(False)
+
+    def update_freq_label(self):
+        self.freq_label.set_label(f"{self.mhz:.1f} MHz")
+        name = next((s["name"] for s in self.state["stations"]
+                     if abs(s["mhz"] - self.mhz) < 0.05 and s.get("name")), "")
+        self.name_label.set_label(name or " ")
+
+    def persist(self):
+        self.state["mhz"] = self.mhz
+        save_state(self.state)
+
+    # ----------------------------------------------------------------- outputs
+
+    def refresh_outputs(self):
+        def apply(outputs):
+            if outputs != self.outputs:
+                self.outputs = outputs
+                self.build_output_rows()
+            self.output_changed()
+        in_thread(list_outputs, apply)
+
+    def poll_outputs(self):
+        self.refresh_outputs()
+        return True
+
+    def effective_output(self):
+        """The saved choice if it can be used now, else the speaker."""
+        usable = [o for o in self.outputs if o["usable"]]
+        chosen = self.state["output"]
+        match = next((o for o in usable if o["key"] == chosen), None)
+        if match is None and chosen.startswith(BLUETOOTH):
+            match = next((o for o in usable if o["kind"] == BLUETOOTH), None)
+        if match is None:
+            match = next((o for o in usable if o["key"] == SPEAKER), None)
+        return match
+
+    def build_output_rows(self):
+        while (row := self.output_list.get_row_at_index(0)) is not None:
+            self.output_list.remove(row)
+        current = self.effective_output()
+        group = None
+        for out in self.outputs:
+            check = Gtk.CheckButton(active=current is not None
+                                    and out["key"] == current["key"])
+            if group:
+                check.set_group(group)
+            else:
+                group = check
+            row = Adw.ActionRow(title=out["title"], subtitle=out["subtitle"],
+                                sensitive=out["usable"])
+            row.add_prefix(Gtk.Image(icon_name=OUTPUT_ICONS[out["kind"]]))
+            row.add_suffix(check)
+            row.set_activatable_widget(check)
+            check.connect("toggled", self.on_output_toggled, out["key"])
+            self.output_list.append(row)
+
+    def on_output_toggled(self, check, key):
+        if not check.get_active() or key == self.state["output"]:
+            return
+        self.state["output"] = key
+        self.persist()
+        self.output_popover.popdown()
+        self.output_changed()
+
+    def output_changed(self):
+        """Show the output in use, and move playback to it if it changed."""
+        current = self.effective_output()
+        kind = current["kind"] if current else SPEAKER
+        self.output_button.set_icon_name(OUTPUT_ICONS[kind])
+        self.output_button.set_tooltip_text(
+            "Output: " + (current["title"] if current else "none available"))
+        sink = current["sink"] if current else None
+        if self.player and sink and (sink != self.player_sink
+                                     or kind != self.player_kind):
+            self.restart_player()
+
+    def on_audio_mode_toggled(self, check, key):
+        if not check.get_active() or key == self.audio_mode:
+            return
+        self.audio_mode = key
+        self.state["audio_mode"] = key
+        self.persist()
+        title = next(t for k, t, _ in AUDIO_MODES if k == key)
+        self.audio_button.set_tooltip_text("Sound: " + title)
+        if self.player:
+            self.restart_player()
+
+    # ----------------------------------------------------------------- stations
+
+    def refresh_stations(self):
+        while (row := self.station_list.get_row_at_index(0)) is not None:
+            self.station_list.remove(row)
+        for st in sorted(self.state["stations"], key=lambda s: s["mhz"]):
+            row = Adw.ActionRow(title=st.get("name") or f"{st['mhz']:.1f} MHz",
+                                subtitle=f"{st['mhz']:.1f} MHz", activatable=True)
+            row.connect("activated", self.on_station_activated, st["mhz"])
+            self.station_list.append(row)
+
+    def on_station_activated(self, _row, mhz):
+        self.stations_popover.popdown()
+        self.tune(mhz, play=True)
+
+    def update_scan_label(self):
+        if self.scanning:
+            text = "Scanning in the background… %d%%" % int(self.scan_progress * 100)
+        elif self.state.get("scanned_at"):
+            text = "Last scanned " + time.strftime(
+                "%-d %b, %H:%M", time.localtime(self.state["scanned_at"]))
+        else:
+            text = "Not scanned yet"
+        self.scan_label.set_label(text)
+        self.progress.set_visible(self.scanning)
+        self.progress.set_fraction(self.scan_progress)
+        self.rescan_button.set_sensitive(not self.scanning)
+
+    def start_scan(self):
+        """Scan in the background; the saved list stays usable meanwhile."""
+        if self.scanning or self.player:
+            return
+        self.scanning = True
+        self.scan_progress = 0.0
+        self.update_scan_label()
+
+        def progress(obj):
+            def show():
+                self.scan_progress = obj["progress"]
+                self.update_scan_label()
+            GLib.idle_add(show)
+
+        def done(result):
+            self.scanning = False
+            if not result.get("cancelled"):
+                found = result["stations"]
+                if found:
+                    old = {round(s["mhz"], 1): s.get("name") for s in self.state["stations"]}
+                    for st in found:
+                        if not st.get("name") and old.get(round(st["mhz"], 1)):
+                            st["name"] = old[round(st["mhz"], 1)]
+                    self.state["stations"] = found
+                    self.state["scanned_at"] = time.time()
+                    self.refresh_stations()
+                    self.update_freq_label()
+                    self.persist()
+                elif not self.state["stations"]:
+                    self.show_error("No stations found. Plug in headphones: "
+                                    "their lead is the aerial.")
+                # the scan left the tuner on its last candidate
+                in_thread(lambda: request("tune", mhz=self.mhz), self.apply_status)
+            self.update_scan_label()
+
+        def fail(e):
+            self.scanning = False
+            self.update_scan_label()
+            self.show_error(e)
+
+        in_thread(lambda: request("scan", stream=progress), done, fail)
+
+    # ----------------------------------------------------------------- actions
+
+    def tune(self, mhz, play=False):
+        """Tune; the daemon stops a background scan to do it."""
+        mhz = min(max(round(mhz, 1), 87.5), 108.0)
+        self.mhz = mhz
+        self.update_freq_label()
+
+        def done(status):
+            self.clear_error()
+            self.apply_status(status)
+            self.persist()
+            if play and not self.player:
+                self.start_audio()
+            self.fetch_name(mhz)
+        in_thread(lambda: request("tune", mhz=mhz), done, self.show_error)
+
+    def fetch_name(self, mhz):
+        def done(info):
+            if abs(mhz - self.mhz) > 0.05 or not info.get("ps"):
+                return
+            match = next((s for s in self.state["stations"]
+                          if abs(s["mhz"] - mhz) < 0.05), None)
+            if match and match.get("name") != info["ps"]:
+                match["name"] = info["ps"]
+                self.refresh_stations()
+                self.persist()
+            self.name_label.set_label(info["ps"])
+        in_thread(lambda: request("rds", seconds=3), done)
+
+    def step_station(self, direction):
+        freqs = sorted(s["mhz"] for s in self.state["stations"])
+        if not freqs:
+            self.tune(self.mhz + 0.1 * direction, play=bool(self.player))
+            return
+        if direction > 0:
+            nxt = next((f for f in freqs if f > self.mhz + 0.05), freqs[0])
+        else:
+            nxt = next((f for f in reversed(freqs) if f < self.mhz - 0.05), freqs[-1])
+        self.tune(nxt, play=bool(self.player))
+
+    def apply_status(self, status):
+        if status.get("scanning"):
+            return                      # the tuner is sweeping, not on our station
+        if not status.get("on"):
+            self.level.set_value(0)
+            self.signal_label.set_label("off")
+            return
+        rssi = status.get("rssi", -110)
+        # map -105 dBm (noise) .. -55 dBm (strong) onto the bar
+        self.level.set_value(min(max((rssi + 105) / 50, 0), 1))
+        self.signal_label.set_label(f"{rssi} dBm")
+
+    def poll(self):
+        in_thread(lambda: request("status"), self.apply_status)
+        return True
+
+    def on_play(self, _button):
+        if self.player:
+            self.stop_audio()
+        else:
+            self.tune(self.mhz, play=True)
+
+    def start_audio(self):
+        if self.player:
+            return
+        if not mixer_available():
+            self.show_error("Tuning works, but FM audio needs the internal FM "
+                            "capture front end: flash boot-sirius-fm2.img")
+            return
+        output = self.effective_output()
+        if not output:
+            self.show_error("There is no output to play on")
+            return
+        try:
+            request("audio", on=True)
+        except DaemonError as e:
+            self.show_error(e)
+            return
+        self.clear_error()
+        set_mixer(True)
+        self.spawn_player(output["sink"])
+        self.play_button.set_icon_name("media-playback-stop-symbolic")
+        self.play_button.set_tooltip_text("Stop")
+
+    def spawn_player(self, sink):
+        # The jack and the speakers share a PCM, so which one plays is a
+        # matter of routing, applied here and undone when playback stops.
+        kind = (self.effective_output() or {}).get("kind", SPEAKER)
+        if have_headphone_codec():
+            apply_route(HEADPHONE_ROUTE if kind == HEADPHONES else SPEAKER_ROUTE)
+        command = build_pipeline(
+            fm_capture_device(),
+            "--device=" + shlex.quote(sink) if sink else "",
+            self.audio_mode)
+        self.player = subprocess.Popen(["sh", "-c", command],
+                                       start_new_session=True)
+        self.player_sink = sink
+        self.player_kind = kind
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.player.pid,
+                             self.on_player_exit, self.player)
+
+    def kill_player(self):
+        player, self.player = self.player, None
+        self.player_sink = None
+        self.player_kind = None
+        if player:
+            try:
+                os.killpg(player.pid, 15)
+            except ProcessLookupError:
+                pass
+
+    def restore_speaker_route(self):
+        """Put the card back on the speakers when this app stops using it."""
+        if have_headphone_codec():
+            apply_route(SPEAKER_ROUTE)
+
+    def restart_player(self):
+        """Move playback to the output in use; the tuner and route stay up."""
+        output = self.effective_output()
+        self.kill_player()
+        if output:
+            self.spawn_player(output["sink"])
+
+    def on_player_exit(self, _pid, status, player):
+        if self.player is not player:
+            return  # replaced by a restart, or stopped on purpose
+        self.player = None
+        self.player_sink = None
+        self.player_kind = None
+        set_mixer(False)
+        self.restore_speaker_route()
+        self.play_button.set_icon_name("media-playback-start-symbolic")
+        self.play_button.set_tooltip_text("Play")
+        if status:
+            self.show_error("Audio stopped: the FM capture route failed to start")
+
+    def stop_audio(self):
+        if not self.player:
+            return
+        self.kill_player()
+        set_mixer(False)
+        self.restore_speaker_route()
+        in_thread(lambda: request("audio", on=False))
+        self.play_button.set_icon_name("media-playback-start-symbolic")
+        self.play_button.set_tooltip_text("Play")
+
+    def on_close(self, *_):
+        self.stop_audio()
+        self.persist()
+        try:
+            request("power", on=False)      # also stops a background scan
+        except DaemonError:
+            pass
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    raise SystemExit(App().run(None))

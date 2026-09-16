@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""FM tuner daemon for the Sony Xperia Z2's Broadcom BCM4335C0.
+
+The tuner lives inside the Bluetooth chip and is controlled with HCI vendor
+command 0xFC15, which needs a raw HCI socket and therefore root. This daemon
+owns that socket and offers a small JSON protocol to unprivileged clients in
+the audio group, over /run/sirius-fm/sirius-fm.sock.
+
+One request per line, one JSON reply per line:
+
+    {"cmd": "power", "on": true}
+    {"cmd": "tune", "mhz": 98.9}           -> status
+    {"cmd": "status"}                       -> {"on", "mhz", "rssi", "snr"}
+    {"cmd": "rds", "seconds": 3}            -> {"ps", "pi"}
+    {"cmd": "audio", "on": true}            -> FM I2S (chip master) on the PCM pads
+    {"cmd": "scan"}                         -> {"progress": 0..1} lines, then
+                                               {"ok": true, "stations": [...],
+                                                "cancelled": false}
+    {"cmd": "cancel"}                       -> stop a running scan
+
+A scan holds the tuner for a minute or so. "tune", "power" and "cancel" stop
+it (its reply then has "cancelled": true), and "status" answers at once while
+it runs, with "scanning": true and the last status read before it started.
+
+Register map and protocol from Sony's
+drivers/bluetooth/broadcom/v4l2_fm_driver (LineageOS android_kernel_sony_msm8974).
+"""
+import errno
+import fcntl
+import grp
+import json
+import os
+import socket
+import socketserver
+import struct
+import threading
+import time
+
+SOCK_DIR = "/run/sirius-fm"
+SOCK_PATH = SOCK_DIR + "/sirius-fm.sock"
+HCI_DEV = int(os.environ.get("SIRIUS_FM_HCI", "0"))
+
+OPCODE_FM = 0xFC15
+# Write_PCM_Pins selects what the chip's PCM pads carry. On the Z2 they go to
+# the SoC's secondary MI2S pads. As I2S master the chip drives bit clock
+# (gpio79, 1.53 MHz), word select (gpio80, 47.8 kHz) and data (gpio81); as
+# slave it sends no data even when LPASS clocks it. So FM uses master mode and
+# LPASS is the clock consumer.
+OPCODE_WRITE_PCM_PINS = 0xFC61
+PCM_PINS_FM_I2S_MASTER = [0x05, 0x19, 0x18, 0x18, 0x18]
+PCM_PINS_BT_PCM = [0x01, 0x19, 0x18, 0x18, 0x18]
+HCI_COMMAND_PKT, HCI_EVENT_PKT = 0x01, 0x04
+EVT_CMD_COMPLETE, EVT_CMD_STATUS = 0x0E, 0x0F
+# ioctl(HCIDEVUP) = _IOW('H', 201, int); powers up the controller, the same as
+# `hciconfig hci0 up`. The FM tuner is in the Bluetooth chip, so it needs the
+# controller up even though FM uses no Bluetooth link.
+HCIDEVUP = 0x400448C9
+
+REG_RDS_SYS, REG_FM_CTRL, REG_RDS_CTL0 = 0x00, 0x01, 0x02
+REG_AUD_CTL0, REG_SCH_TUNE, REG_FREQ = 0x05, 0x09, 0x0A
+REG_RSSI, REG_FLAG, REG_RDS_WLINE = 0x0F, 0x12, 0x14
+REG_RDS_DATA, REG_SNR = 0x80, 0xDF
+REG_PCM_ROUTE, REG_VOLUME = 0x4D, 0xF8
+# AUD_CTL0: bit1 manual mute, bits 2-3 left/right un-mute, bit4 DAC, bit5 I2S,
+# bit6 75 us de-emphasis (clear for 50 us in the UK and Europe). Broadcom's
+# own driver always sets bits 2 and 3; without them the I2S samples are zero.
+AUD_I2S_UNMUTED = 0x2C
+AUD_MUTED = 0x0E
+PCM_ROUTE_TO_SCO = 0x80
+FLAG_TUNE_DONE, FLAG_TUNE_FAIL = 0x01, 0x02
+HCI_COMMAND_DISALLOWED = 0x0C
+
+BAND_LO, BAND_HI, STEP = 87.5, 108.0, 0.1
+
+
+class HciError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class Tuner:
+    def __init__(self, dev=HCI_DEV):
+        self.lock = threading.Lock()
+        self.sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW,
+                                  socket.BTPROTO_HCI)
+        self.sock.bind((dev,))
+        # struct hci_filter { u32 type_mask; u32 event_mask[2]; u16 opcode; }
+        flt = struct.pack("<IIIH2x", 1 << HCI_EVENT_PKT,
+                          (1 << EVT_CMD_COMPLETE) | (1 << EVT_CMD_STATUS), 0, 0)
+        self.sock.setsockopt(socket.SOL_HCI, socket.HCI_FILTER, flt)
+        self.sock.settimeout(2.0)
+        self.on = False
+        self.cancel = threading.Event()
+        self.scanning = False
+        self.last_status = {"on": False}
+        self._up = False            # is the Bluetooth controller powered up?
+        self._up_retry_after = 0.0  # skip the slow power-up ioctl until this time
+        self._up_error = ""
+
+    def ensure_up(self):
+        """Power the Bluetooth controller up; the FM tuner is inside it.
+
+        Idempotent. HCIDEVUP blocks for several seconds while the BCM chip is
+        set up, and on this hardware that fails if Bluetooth was turned off
+        (the chip does not re-init without a reboot). So after a failure, fail
+        fast for a while instead of hanging on every request.
+        """
+        if self._up:
+            return
+        if time.monotonic() < self._up_retry_after:
+            raise HciError(self._up_error)
+        try:
+            fcntl.ioctl(self.sock, HCIDEVUP, HCI_DEV)
+        except OSError as e:
+            if e.errno == errno.EALREADY:
+                self._up = True
+                return
+            if e.errno == errno.ERFKILL:
+                self._up_error = ("Bluetooth is blocked. The FM tuner is in the "
+                                  "Bluetooth chip, so turn Bluetooth on to use "
+                                  "the radio.")
+            else:
+                self._up_error = ("The Bluetooth chip is not responding. The FM "
+                                  "tuner is inside it, so the radio needs "
+                                  "Bluetooth on. If it was just turned off, a "
+                                  "reboot may be needed to bring the chip back.")
+            self._up_retry_after = time.monotonic() + 20
+            raise HciError(self._up_error)
+        self._up = True
+        time.sleep(0.2)     # let the controller finish coming up before commands
+
+    def _drain(self):
+        self.sock.setblocking(False)
+        try:
+            while True:
+                self.sock.recv(300)
+        except (BlockingIOError, InterruptedError):
+            pass
+        finally:
+            self.sock.settimeout(2.0)
+
+    def _cmd(self, payload, opcode=OPCODE_FM):
+        # Every raw HCI socket sees every event, so discard anything queued
+        # and only accept the completion for this opcode (and, for FM
+        # register access, the one that echoes this register and mode).
+        self._drain()
+        pkt = bytes([HCI_COMMAND_PKT, opcode & 0xFF, opcode >> 8,
+                     len(payload)]) + bytes(payload)
+        try:
+            self.sock.send(pkt)
+        except OSError as e:
+            # The controller is down (Bluetooth turned off): ENETDOWN. Power it
+            # up and try once more before giving up.
+            if e.errno not in (errno.ENETDOWN, errno.ENODEV):
+                raise
+            self._up = False
+            self.ensure_up()
+            self._drain()
+            self.sock.send(pkt)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                ev = self.sock.recv(300)
+            except socket.timeout:
+                break
+            if len(ev) < 7 or ev[0] != HCI_EVENT_PKT:
+                continue
+            if ev[1] == EVT_CMD_COMPLETE and ev[4] | (ev[5] << 8) == opcode:
+                if ev[6] != 0:
+                    raise HciError(f"command {opcode:#06x} {payload[0]:#04x} "
+                                   f"refused, status {ev[6]:#x}", ev[6])
+                if opcode != OPCODE_FM:
+                    return ev[7:]
+                if len(ev) >= 9 and (ev[7], ev[8]) != (payload[0], payload[1]):
+                    continue
+                return ev[9:]           # after status, register, rw
+            if ev[1] == EVT_CMD_STATUS and ev[5] | (ev[6] << 8) == opcode \
+                    and ev[3] != 0:
+                raise HciError(f"command {opcode:#06x} rejected, status {ev[3]:#x}")
+        raise HciError("no reply from the FM core")
+
+    def wr(self, reg, *vals):
+        self._cmd([reg, 0x00, *vals])
+
+    def rd(self, reg, n):
+        return self._cmd([reg, 0x01, n])
+
+    # --- operations, all called with self.lock held -------------------------
+
+    def clear_flags(self):
+        """Read the interrupt flags; reading clears them."""
+        f = self.rd(REG_FLAG, 2)
+        return f[0] | f[1] << 8 if len(f) >= 2 else 0
+
+    def is_on(self):
+        return bool(self.rd(REG_RDS_SYS, 1)[0] & 0x01)
+
+    def power(self, on):
+        if on:
+            self.wr(REG_RDS_SYS, 0x03)        # FM on, RDS on
+            # Power-on starts a tune of its own; SCH_TUNE is refused with
+            # Command Disallowed until its completion flag has been read.
+            end = time.monotonic() + 0.3
+            while time.monotonic() < end and \
+                    not self.clear_flags() & (FLAG_TUNE_DONE | FLAG_TUNE_FAIL):
+                time.sleep(0.02)
+            self.wr(REG_FM_CTRL, 0x02)        # stereo auto, west band
+            self.wr(REG_RDS_CTL0, 0x02)       # RDS (not RBDS), flush FIFO
+            self.wr(REG_RDS_WLINE, 0x10)
+        else:
+            self.audio(False)
+            self.wr(REG_RDS_SYS, 0x00)
+        self.on = on
+
+    def tune(self, mhz, settle=0.03):
+        mhz = min(max(round(mhz, 1), BAND_LO), BAND_HI)
+        v = int(round(mhz * 1000)) - 64000
+        self.wr(REG_FREQ, v & 0xFF, v >> 8)
+        self.clear_flags()
+        for attempt in range(6):
+            try:
+                self.wr(REG_SCH_TUNE, 0x01)  # preset: tune to exactly this
+                break
+            except HciError as e:
+                if e.status != HCI_COMMAND_DISALLOWED or attempt == 5:
+                    raise
+                self.clear_flags()
+                time.sleep(0.03)
+        # wait for the chip to report the tune finished (typically ~65 ms)
+        end = time.monotonic() + 0.8
+        while time.monotonic() < end:
+            flags = self.clear_flags()
+            if flags & FLAG_TUNE_FAIL:
+                raise HciError(f"tune to {mhz} MHz failed")
+            if flags & FLAG_TUNE_DONE:
+                break
+            time.sleep(0.015)
+        self.wr(REG_RDS_CTL0, 0x02)          # drop RDS from the old station
+        if settle:
+            time.sleep(settle)
+        return mhz
+
+    def status(self):
+        self.on = self.is_on()
+        if not self.on:
+            return {"on": False}
+        f = self.rd(REG_FREQ, 2)
+        rssi = self.rd(REG_RSSI, 1)[0]
+        return {"on": True,
+                "mhz": round(((f[0] | f[1] << 8) + 64000) / 1000, 1),
+                "rssi": rssi - 256 if rssi > 127 else rssi,
+                "snr": self.rd(REG_SNR, 1)[0]}
+
+    def audio(self, on):
+        """Send FM audio out of the chip's PCM pads as I2S, or stop it."""
+        if on:
+            self._cmd(PCM_PINS_FM_I2S_MASTER, OPCODE_WRITE_PCM_PINS)
+            route = self.rd(REG_PCM_ROUTE, 1)[0]
+            self.wr(REG_PCM_ROUTE, route & ~PCM_ROUTE_TO_SCO)
+            self.wr(REG_VOLUME, 0xFF, 0x00)
+            self.wr(REG_AUD_CTL0, AUD_I2S_UNMUTED, 0x00)
+        else:
+            self.wr(REG_AUD_CTL0, AUD_MUTED, 0x00)
+            self._cmd(PCM_PINS_BT_PCM, OPCODE_WRITE_PCM_PINS)
+
+    def rds(self, seconds=3.0):
+        ps, seen, pi, blocks = [" "] * 8, [False] * 4, None, {}
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not all(seen):
+            data = self.rd(REG_RDS_DATA, 240)
+            for i in range(0, len(data) - 2, 3):
+                t, hi, lo = data[i], data[i + 1], data[i + 2]
+                blk, quality = t >> 4, (t >> 2) & 3
+                if quality == 3:
+                    blocks = {}
+                    continue
+                word = hi << 8 | lo
+                if blk == 0:
+                    blocks, pi = {0: word}, word
+                elif 0 in blocks and blk in (1, 3, 4):
+                    blocks[blk] = word
+                    if blk == 3 and 1 in blocks:
+                        b = blocks[1]
+                        if b >> 12 == 0:        # group 0A/0B: programme service
+                            seg = b & 3
+                            ps[seg * 2] = chr(hi) if 32 <= hi < 127 else " "
+                            ps[seg * 2 + 1] = chr(lo) if 32 <= lo < 127 else " "
+                            seen[seg] = True
+                        blocks = {}
+            time.sleep(0.25)
+        name = "".join(ps).strip() if all(seen) else ""
+        return {"ps": name, "pi": f"{pi:04X}" if pi is not None else ""}
+
+    def scan(self, progress):
+        """Find stations in two passes.
+
+        RSSI is valid as soon as a tune completes, but SNR only updates
+        120-190 ms later, so a sweep that waits for SNR at every step is
+        slow and one that does not wait rejects real stations. Sweep on RSSI
+        alone, then dwell on each peak to confirm SNR and read its name.
+
+        Returns None if cancelled; self.cancel is checked at every step.
+        """
+        self.cancel.clear()
+        self.scanning = True
+        try:
+            return self._scan(progress)
+        finally:
+            self.scanning = False
+
+    def _scan(self, progress):
+        was_on = self.is_on()
+        if not was_on:
+            self.power(True)
+        total = int(round((BAND_HI - BAND_LO) / STEP)) + 1
+        points = []
+        for i in range(total):
+            if self.cancel.is_set():
+                return None
+            mhz = round(BAND_LO + i * STEP, 1)
+            self.tune(mhz, settle=0.0)
+            rssi = self.rd(REG_RSSI, 1)[0]
+            points.append((mhz, rssi - 256 if rssi > 127 else rssi))
+            if i % 5 == 0:
+                progress(0.5 * i / total)
+
+        ordered = sorted(r for _, r in points)
+        floor = ordered[len(ordered) // 2]
+        threshold = max(-88, floor + 10)
+        candidates = []
+        for i, (mhz, rssi) in enumerate(points):
+            left = points[i - 1][1] if i else -200
+            right = points[i + 1][1] if i + 1 < len(points) else -200
+            if rssi < threshold or rssi < left or rssi < right:
+                continue
+            if candidates and mhz - candidates[-1][0] < 0.25:
+                if rssi > candidates[-1][1]:
+                    candidates[-1] = (mhz, rssi)
+                continue
+            candidates.append((mhz, rssi))
+
+        stations = []
+        for n, (mhz, _) in enumerate(candidates):
+            if self.cancel.is_set():
+                return None
+            self.tune(mhz, settle=0.25)
+            snr = self.rd(REG_SNR, 1)[0]
+            rssi = self.rd(REG_RSSI, 1)[0]
+            rssi = rssi - 256 if rssi > 127 else rssi
+            if snr >= 15:
+                info = self.rds(2.5)
+                stations.append({"mhz": mhz, "rssi": rssi, "snr": snr,
+                                 "name": info["ps"], "pi": info["pi"]})
+            progress(0.5 + 0.5 * (n + 1) / max(len(candidates), 1))
+        if not was_on:
+            self.power(False)
+        return stations
+
+
+TUNER = None
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def reply(self, obj):
+        try:
+            self.wfile.write((json.dumps(obj) + "\n").encode())
+            self.wfile.flush()
+        except OSError:
+            pass                        # the client went away; nothing to tell
+
+    def handle(self):
+        for line in self.rfile:
+            try:
+                req = json.loads(line)
+                cmd = req.get("cmd")
+                if cmd in ("tune", "power", "cancel"):
+                    TUNER.cancel.set()      # a waiting scan gives up the tuner
+                if cmd == "cancel":
+                    self.reply({"ok": True})
+                    continue
+                if cmd == "status" and not TUNER.lock.acquire(blocking=False):
+                    self.reply({"ok": True, "scanning": TUNER.scanning,
+                                **TUNER.last_status})
+                    continue
+                if cmd == "status":
+                    try:
+                        TUNER.last_status = TUNER.status()
+                        self.reply({"ok": True, "scanning": False,
+                                    **TUNER.last_status})
+                    finally:
+                        TUNER.lock.release()
+                    continue
+                with TUNER.lock:
+                    if cmd == "power":
+                        TUNER.power(bool(req.get("on")))
+                        self.reply({"ok": True, **TUNER.status()})
+                    elif cmd == "tune":
+                        if not TUNER.on:
+                            TUNER.power(True)
+                        TUNER.tune(float(req["mhz"]))
+                        self.reply({"ok": True, **TUNER.status()})
+                    elif cmd == "rds":
+                        self.reply({"ok": True,
+                                    **TUNER.rds(float(req.get("seconds", 3)))})
+                    elif cmd == "audio":
+                        TUNER.audio(bool(req.get("on")))
+                        self.reply({"ok": True})
+                    elif cmd == "scan":
+                        stations = TUNER.scan(
+                            lambda p: self.reply({"progress": round(p, 3)}))
+                        self.reply({"ok": True, "stations": stations or [],
+                                    "cancelled": stations is None})
+                    else:
+                        self.reply({"ok": False, "error": f"unknown command {cmd!r}"})
+            except (HciError, OSError, KeyError, ValueError) as e:
+                self.reply({"ok": False, "error": str(e)})
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+def main():
+    global TUNER
+    TUNER = Tuner()
+    os.makedirs(SOCK_DIR, exist_ok=True)
+    try:
+        os.unlink(SOCK_PATH)
+    except FileNotFoundError:
+        pass
+    srv = Server(SOCK_PATH, Handler)
+    gid = grp.getgrnam("audio").gr_gid
+    os.chown(SOCK_DIR, 0, gid)
+    os.chmod(SOCK_DIR, 0o750)
+    os.chown(SOCK_PATH, 0, gid)
+    os.chmod(SOCK_PATH, 0o660)
+    try:
+        srv.serve_forever()
+    finally:
+        try:
+            with TUNER.lock:
+                TUNER.power(False)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

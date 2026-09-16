@@ -1,0 +1,12 @@
+[Unit]
+Description=FM tuner service for the Xperia Z2 Broadcom chip
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+ExecStart=/usr/local/sbin/sirius-fmd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
