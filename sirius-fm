@@ -35,13 +35,12 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 # the secondary MI2S pads, so the back end is SEC_MI2S_TX.
 MIXER = "MultiMedia2 Mixer SEC_MI2S_TX"
 CARD = os.environ.get("SIRIUS_FM_CARD", "0")
-# Audio processing modes, chosen from the header. Mono and noise reduction are
-# what a hardware radio does on a weak signal; kept optional so they can be
-# compared on air (different locations, aerial length).
-NR, MONO, STEREO = "nr", "mono", "stereo"
+# Audio processing modes, chosen from the header. Summing to mono is what a
+# hardware radio does on a weak signal, because FM stereo carries the L-R
+# difference and that is where the hiss lives.
+MONO, STEREO = "mono", "stereo"
 AUDIO_MODES = [
-    (NR, "Noise reduction", "Mono, high frequencies rolled off"),
-    (MONO, "Mono", "Both channels summed, full range"),
+    (MONO, "Mono", "Both channels summed"),
     (STEREO, "Stereo", "Raw capture, no processing"),
 ]
 AUDIO_ICON = "audio-x-generic-symbolic"
@@ -74,8 +73,7 @@ def build_pipeline(device, sink, mode):
            "--client-name='Robwatts Radio' --stream-name='Robwatts Radio'"
     if mode == STEREO or not have_filter():
         return f"{src} | {tail} --channels=2"
-    flags = " --no-lowpass" if mode == MONO else ""
-    return f"{src} | sirius-fm-downmix{flags} | {tail} --channels=1"
+    return f"{src} | sirius-fm-downmix | {tail} --channels=1"
 
 SPEAKER, HEADPHONES, BLUETOOTH = "speaker", "headphones", "bluetooth"
 OUTPUT_ICONS = {
@@ -289,9 +287,9 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(360, 720)
         self.state = load_state()
         self.mhz = float(self.state["mhz"])
-        self.audio_mode = self.state.get("audio_mode", NR)
+        self.audio_mode = self.state.get("audio_mode", MONO)
         if self.audio_mode not in dict((m[0], m) for m in AUDIO_MODES):
-            self.audio_mode = NR
+            self.audio_mode = MONO
         self.outputs = []
         self.player = None
         self.player_sink = None
@@ -302,7 +300,7 @@ class Window(Adw.ApplicationWindow):
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
 
-        # Sound mode, top left: stereo / mono / noise reduction.
+        # Sound mode, top left: mono or stereo.
         self.audio_button = Gtk.MenuButton(icon_name=AUDIO_ICON,
                                            tooltip_text="Sound")
         audio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
@@ -329,7 +327,7 @@ class Window(Adw.ApplicationWindow):
         audio_box.append(audio_list)
         if not have_filter():
             audio_box.append(Gtk.Label(
-                label="Install the app to enable mono and noise reduction.",
+                label="Install the app to enable mono.",
                 xalign=0, wrap=True, css_classes=["caption", "dim-label"]))
         self.audio_button.set_popover(Gtk.Popover(child=audio_box))
         self.audio_button.set_tooltip_text(

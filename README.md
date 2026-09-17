@@ -59,10 +59,10 @@ port's `fmrepair` plugin is installed (`drivers/audio/fmrepair` in that
 project): the tuner's I2S link corrupts the sign bit of a burst of samples
 41.6 times a second, and the plugin repairs those bursts at the device layer
 so this app, and any other client, gets clean audio. Without the plugin the
-app reads the raw device and the buzz is audible. The Sound menu's Mono and
-Noise reduction modes (`sirius-fm-downmix`, a small C helper built by
-install.sh: mono sum, optional 12 kHz low-pass) are for weak-signal stereo
-hiss, the way a hardware radio blends to mono; they are optional. The
+app reads the raw device and the buzz is audible. The Sound menu's Mono mode
+(`sirius-fm-downmix`, a small C helper built by install.sh) sums the two
+channels, which drops the weak-signal hiss that FM stereo carries in the L-R
+difference, the way a hardware radio blends to mono. The
 sound-card side (device tree links, machine driver, fmrepair plugin) is in
 the Xperia Z2 project; see the hardware notes in the
 port's own repository, `RobLymm/xperia-sirius-linux`.

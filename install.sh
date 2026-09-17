@@ -9,7 +9,7 @@ sudo install -m 0755 "$HERE/sirius-fm" /usr/local/bin/sirius-fm
 # 48 kHz on this SoC. Build it with whatever compiler is present.
 CC=$(command -v clang || command -v cc || command -v gcc || true)
 if [ -n "$CC" ]; then
-	"$CC" -O2 -o /tmp/sirius-fm-downmix "$HERE/sirius-fm-downmix.c" -lm &&
+	"$CC" -O2 -o /tmp/sirius-fm-downmix "$HERE/sirius-fm-downmix.c" &&
 		sudo install -m 0755 /tmp/sirius-fm-downmix /usr/local/bin/sirius-fm-downmix
 else
 	echo "no C compiler found; FM audio will play in stereo without the low-pass"
