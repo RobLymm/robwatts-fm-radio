@@ -6,7 +6,8 @@ needs to reach the tuner.
 No existing Linux FM app works on this phone: they all expect a kernel radio
 device (`/dev/radio0`), and the Z2's tuner is the FM core inside the Broadcom
 BCM4335C0 Bluetooth chip, driven by HCI vendor commands. See
-`../../docs/fm-broadcom.md`.
+the hardware notes in the
+port's own repository, `RobLymm/xperia-sirius-linux`.
 
 ## Parts
 
@@ -25,9 +26,19 @@ BCM4335C0 Bluetooth chip, driven by HCI vendor commands. See
   - **Output.** Its icon shows the output in use (speaker, Bluetooth or
     headphones) and it opens the list to change it. Bluetooth is greyed when
     no audio device is connected and lists each connected device otherwise.
-    Headphones are greyed until the headphone codec (WCD9320) has a driver.
-    The last choice is remembered and used whenever it is available;
-    otherwise the speaker.
+    Headphones are greyed when the WCD9320 codec is not loaded. The last
+    choice is remembered and used whenever it is available; otherwise the
+    speaker.
+
+    The speaker and the headphone jack are the same PCM with different
+    routing, so choosing between them means setting mixer controls rather
+    than choosing a sink. The sound server will not do it: PulseAudio turns
+    two routes that share a PCM into two card profiles rather than two ports
+    on one sink, and switching profile drops the sink and often fails to
+    bring the new one up. So the app sets the route itself, when playback
+    starts, and puts it back to the speaker when playback stops. Nothing
+    detects whether anything is plugged into the jack; the codec's jack
+    detection is not driven yet.
   - **Stations.** The saved station list. A scan runs in the background each
     time the app opens (about 40 seconds). The saved list stays usable
     meanwhile and is only replaced when the scan finds stations, so opening
@@ -53,7 +64,8 @@ Noise reduction modes (`sirius-fm-downmix`, a small C helper built by
 install.sh: mono sum, optional 12 kHz low-pass) are for weak-signal stereo
 hiss, the way a hardware radio blends to mono; they are optional. The
 sound-card side (device tree links, machine driver, fmrepair plugin) is in
-the Xperia Z2 project; see `../../docs/fm-broadcom.md`.
+the Xperia Z2 project; see the hardware notes in the
+port's own repository, `RobLymm/xperia-sirius-linux`.
 
 ## Install
 
